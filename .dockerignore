@@ -1,0 +1,21 @@
+# Version control
+.git
+.gitignore
+
+# Terraform - not needed inside the application image
+bootstrap/
+live/
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+
+# Python
+**/__pycache__/
+*.py[cod]
+.venv
+venv
+
+# Local env files - never bake secrets into an image
+.env
+*.env
