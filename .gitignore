@@ -1,0 +1,33 @@
+# Local .terraform directories
+**/.terraform/*
+
+# Terraform state files
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Note: .terraform.lock.hcl is intentionally NOT ignored - it's committed
+# so provider versions stay reproducible across machines and CI.
+
+# Crash log files
+crash.log
+crash.*.log
+
+# Variable files are likely to contain secrets - keep only the checked-in example
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+# Saved plan output
+*.tfplan
+*tfplan*
+
+# Local overrides - not meant to be shared
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Terraform CLI config
+.terraformrc
+terraform.rc
