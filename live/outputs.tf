@@ -22,3 +22,18 @@ output "nat_instance_private_ip" {
   description = "Private IP address of the NAT instance"
   value       = aws_instance.nat.private_ip
 }
+
+output "k3s_instance_id" {
+  description = "ID of the k3s node instance"
+  value       = aws_instance.k3s.id
+}
+
+output "k3s_instance_private_ip" {
+  description = "Private IP address of the k3s node instance"
+  value       = aws_instance.k3s.private_ip
+}
+
+output "ecr_repository_url" {
+  description = "URL of the ECR repository for the app image"
+  value       = aws_ecr_repository.app.repository_url
+}
