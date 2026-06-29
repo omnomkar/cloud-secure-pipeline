@@ -14,10 +14,12 @@ spec:
       labels:
         {{- include "secure-cloud-pipeline.selectorLabels" . | nindent 8 }}
     spec:
-      # No imagePullSecrets: the k3s node's IAM role (live/k3s_instance.tf,
-      # Phase 3) already has ecr:BatchGetImage/GetDownloadUrlForLayer on
-      # this repo, and containerd's native ECR credential support uses that
-      # instance role automatically - no pull secret to create or rotate.
+      # imagePullSecrets: self-managed clusters (k3s here) don't get the
+      # automatic IAM-role-based ECR auth that EKS provides - that's an
+      # EKS-specific integration, not a general Kubernetes feature. This
+      # secret holds a short-lived ECR token instead (expires ~12h).
+      imagePullSecrets:
+        - name: ecr-pull-secret
       containers:
         - name: {{ include "secure-cloud-pipeline.name" . }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
