@@ -72,7 +72,7 @@ resource "aws_security_group" "k3s" {
 }
 
 resource "aws_instance" "k3s" {
-  ami = data.aws_ami.amazon_linux_2023.id 
+  ami                    = data.aws_ami.amazon_linux_2023.id
   instance_type          = var.k3s_instance_type
   subnet_id              = aws_subnet.private.id
   vpc_security_group_ids = [aws_security_group.k3s.id]

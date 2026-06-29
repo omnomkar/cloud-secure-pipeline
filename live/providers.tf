@@ -6,17 +6,23 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    # Used once in oidc.tf to fetch GitHub's current OIDC signing certificate
+    # thumbprint, instead of hardcoding a value that GitHub could rotate.
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
+    }
   }
 
   # Created by running `bootstrap/` first. Replace the two placeholders
   # below with the `state_bucket_name` and `dynamodb_table_name` outputs
   # from that step, then run `terraform init` here.
   backend "s3" {
-  bucket         = "omkar-tfstate-0001"
-  key            = "secure-cloud-pipeline/terraform.tfstate"
-  region         = "us-east-1"
-  dynamodb_table = "terraform-locks"
-  encrypt        = true
+    bucket         = "omkar-tfstate-0001"
+    key            = "secure-cloud-pipeline/terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "terraform-locks"
+    encrypt        = true
   }
 }
 
