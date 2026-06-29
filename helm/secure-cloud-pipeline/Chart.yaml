@@ -1,0 +1,6 @@
+apiVersion: v2
+name: secure-cloud-pipeline
+description: Flask app deployed onto the k3s node provisioned in live/
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

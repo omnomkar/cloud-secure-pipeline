@@ -1,0 +1,136 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "Dockerfile"
+
+# id-token: write is what lets this workflow request an OIDC token from
+# GitHub at all - without it, configure-aws-credentials has nothing to hand
+# AWS and the AssumeRoleWithWebIdentity call fails before it starts.
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  # Repository VARIABLES (not secrets - none of this is sensitive, it's all
+  # either public AWS resource identifiers or this repo's own coordinates).
+  # Set once under Settings -> Secrets and variables -> Actions -> Variables.
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  K3S_INSTANCE_ID: ${{ vars.K3S_INSTANCE_ID }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # No AWS access keys anywhere in this job - this exchanges the
+      # workflow's GitHub-issued OIDC token for short-lived AWS credentials,
+      # scoped by the trust policy in live/oidc.tf to exactly this repo's
+      # main branch.
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          set -euo pipefail
+          IMAGE_TAG="${GITHUB_SHA::7}"
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+          docker build -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "ecr_registry=$ECR_REGISTRY" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger deploy on the k3s node via SSM
+        env:
+          IMAGE_TAG: ${{ steps.build.outputs.image_tag }}
+          ECR_REGISTRY: ${{ steps.build.outputs.ecr_registry }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # The SSM agent on the node only runs whatever shell script we hand
+          # it here - it has no way to receive the helm/ directory from this
+          # checkout directly. Rather than stand up an S3 bucket (and the
+          # extra IAM to write/read it) just to ship chart files around, the
+          # script below pulls the chart straight from this exact commit's
+          # public GitHub tarball. That also guarantees the chart version
+          # deployed always matches the image being deployed.
+          cat > deploy.sh <<EOF
+          #!/bin/bash
+          set -euo pipefail
+
+          if ! command -v helm >/dev/null 2>&1; then
+            curl -fsSL -o /tmp/get-helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+            chmod +x /tmp/get-helm.sh
+            /tmp/get-helm.sh
+            rm -f /tmp/get-helm.sh
+          fi
+
+          rm -rf /tmp/scp-deploy
+          mkdir -p /tmp/scp-deploy
+          curl -fsSL "https://codeload.github.com/${{ github.repository }}/tar.gz/${GIT_SHA}" \
+            -o /tmp/scp-deploy/source.tar.gz
+          tar -xzf /tmp/scp-deploy/source.tar.gz --strip-components=1 -C /tmp/scp-deploy
+
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          helm upgrade --install secure-cloud-pipeline /tmp/scp-deploy/helm/secure-cloud-pipeline \
+            --set image.repository="${ECR_REGISTRY}/${ECR_REPOSITORY}" \
+            --set image.tag="${IMAGE_TAG}"
+          EOF
+
+          jq -n --rawfile script deploy.sh '{commands: [$script]}' > params.json
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$K3S_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy ${{ github.repository }}@${GIT_SHA}" \
+            --parameters file://params.json \
+            --query "Command.CommandId" --output text)
+
+          echo "SSM command ID: $COMMAND_ID"
+
+          for _ in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$K3S_INSTANCE_ID" \
+              --query "Status" --output text 2>/dev/null || echo "Pending")
+
+            echo "Deploy status: $STATUS"
+
+            case "$STATUS" in
+              Success)
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut)
+                echo "::error::SSM deploy command finished with status $STATUS"
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$K3S_INSTANCE_ID" \
+                  --query "StandardErrorContent" --output text
+                exit 1
+                ;;
+            esac
+
+            sleep 10
+          done
+
+          echo "::error::Timed out waiting for the SSM deploy command to finish"
+          exit 1

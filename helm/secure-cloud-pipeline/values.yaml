@@ -1,0 +1,26 @@
+# image.repository has no default - it's set per-deploy via
+# `--set image.repository=<ecr-registry>/<ecr-repo>` so this chart never
+# hardcodes an AWS account ID.
+image:
+  repository: ""
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+service:
+  port: 5000
+
+# Sized conservatively for a t3.small (2 vCPU, 2GiB RAM) running alongside
+# k3s's own system pods - leaves headroom rather than packing the box tight.
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi
+
+# Placeholder until Phase 5 wires this up to AWS Secrets Manager instead.
+app:
+  secretMessage: "default-message-not-from-secrets-manager-yet"

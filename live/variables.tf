@@ -38,3 +38,27 @@ variable "nat_instance_type" {
   type        = string
   default     = "t3.nano"
 }
+
+variable "k3s_instance_type" {
+  description = "Instance type for the k3s node"
+  type        = string
+  default     = "t3.small"
+}
+
+variable "k3s_version" {
+  description = "k3s version to install, pinned explicitly (never install \"latest\" on a box you can't reproduce)"
+  type        = string
+  default     = "v1.36.2+k3s1"
+}
+
+# No defaults on these two: they're specific to my fork of this repo, not
+# generic enough to ship a sane default for.
+variable "github_org" {
+  description = "GitHub organization or username that owns the repo allowed to assume the CI/CD OIDC role"
+  type        = string
+}
+
+variable "github_repo" {
+  description = "GitHub repository name (without the org prefix) allowed to assume the CI/CD OIDC role"
+  type        = string
+}

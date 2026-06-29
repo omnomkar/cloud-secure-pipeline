@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "secure-cloud-pipeline.fullname" . }}
+  labels:
+    {{- include "secure-cloud-pipeline.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "secure-cloud-pipeline.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "secure-cloud-pipeline.selectorLabels" . | nindent 8 }}
+    spec:
+      # No imagePullSecrets: the k3s node's IAM role (live/k3s_instance.tf,
+      # Phase 3) already has ecr:BatchGetImage/GetDownloadUrlForLayer on
+      # this repo, and containerd's native ECR credential support uses that
+      # instance role automatically - no pull secret to create or rotate.
+      containers:
+        - name: {{ include "secure-cloud-pipeline.name" . }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 5000
+          env:
+            - name: APP_SECRET_MESSAGE
+              value: {{ .Values.app.secretMessage | quote }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
