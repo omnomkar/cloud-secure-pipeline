@@ -1,0 +1,188 @@
+{{- if .Values.monitoring.enabled }}
+# Admin password: --set monitoring.grafana.adminPassword=<value> at deploy
+# time pins it explicitly (same pattern as image.repository / awsRegion
+# elsewhere in this chart). Left unset, `lookup` checks whether a Secret
+# from a previous `helm upgrade` already exists and reuses its password
+# instead of generating a new one - without this, randAlphaNum would mint a
+# fresh password on every single `helm upgrade`, locking you out of Grafana
+# each time this chart redeploys. Only a genuinely first install (no prior
+# Secret found) falls through to randAlphaNum.
+{{- $secretName := printf "%s-grafana-admin" (include "secure-cloud-pipeline.fullname" . | trunc 40 | trimSuffix "-") }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $secretName }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secretName }}
+  labels:
+    {{- include "secure-cloud-pipeline.labels" . | nindent 4 }}
+type: Opaque
+data:
+  admin-password: {{ if .Values.monitoring.grafana.adminPassword }}{{ .Values.monitoring.grafana.adminPassword | b64enc }}{{ else if $existing }}{{ index $existing.data "admin-password" }}{{ else }}{{ randAlphaNum 20 | b64enc }}{{ end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "secure-cloud-pipeline.fullname" . | trunc 40 | trimSuffix "-" }}-grafana-datasources
+  labels:
+    {{- include "secure-cloud-pipeline.labels" . | nindent 4 }}
+data:
+  # Grafana's provisioning format - dropped into
+  # /etc/grafana/provisioning/datasources so Prometheus is wired up on
+  # first boot, no manual "Add data source" click-through needed.
+  datasource.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        uid: prometheus
+        type: prometheus
+        access: proxy
+        url: http://{{ include "secure-cloud-pipeline.fullname" . | trunc 40 | trimSuffix "-" }}-prometheus:9090
+        isDefault: true
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "secure-cloud-pipeline.fullname" . | trunc 40 | trimSuffix "-" }}-grafana-dashboards
+  labels:
+    {{- include "secure-cloud-pipeline.labels" . | nindent 4 }}
+data:
+  # Provisioning provider - tells Grafana to load any dashboard JSON it
+  # finds in this mounted directory, rather than requiring it to be
+  # imported by hand through the UI.
+  provider.yaml: |
+    apiVersion: 1
+    providers:
+      - name: default
+        folder: ""
+        type: file
+        options:
+          path: /var/lib/grafana/dashboards
+  # One dashboard, on purpose: this proves the Prometheus -> Grafana wiring
+  # works, it isn't meant to be a production observability suite.
+  pod-resources.json: |
+    {
+      "title": "Pod CPU & Memory",
+      "uid": "pod-resources",
+      "schemaVersion": 39,
+      "timezone": "browser",
+      "time": { "from": "now-1h", "to": "now" },
+      "refresh": "30s",
+      "panels": [
+        {
+          "id": 1,
+          "title": "Pod CPU Usage (cores)",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "gridPos": { "h": 10, "w": 24, "x": 0, "y": 0 },
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "expr": "sum(rate(container_cpu_usage_seconds_total{container!=\"\", container!=\"POD\"}[5m])) by (pod)",
+              "legendFormat": "{{`{{pod}}`}}"
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "title": "Pod Memory Usage (bytes)",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "gridPos": { "h": 10, "w": 24, "x": 0, "y": 10 },
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "expr": "sum(container_memory_working_set_bytes{container!=\"\", container!=\"POD\"}) by (pod)",
+              "legendFormat": "{{`{{pod}}`}}"
+            }
+          ]
+        }
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "secure-cloud-pipeline.fullname" . | trunc 40 | trimSuffix "-" }}-grafana
+  labels:
+    {{- include "secure-cloud-pipeline.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "secure-cloud-pipeline.name" . }}-grafana
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "secure-cloud-pipeline.name" . }}-grafana
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      containers:
+        - name: grafana
+          image: "{{ .Values.monitoring.grafana.image.repository }}:{{ .Values.monitoring.grafana.image.tag }}"
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: GF_SECURITY_ADMIN_USER
+              value: admin
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: admin-password
+            # No public access, no anonymous org, no plugin install at
+            # startup - kept to defaults beyond what's needed to provision
+            # the one datasource and one dashboard below.
+          volumeMounts:
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources
+            - name: dashboard-provider
+              mountPath: /etc/grafana/provisioning/dashboards
+            - name: dashboard-json
+              mountPath: /var/lib/grafana/dashboards
+            - name: storage
+              mountPath: /var/lib/grafana
+          resources:
+            {{- toYaml .Values.monitoring.grafana.resources | nindent 12 }}
+      volumes:
+        - name: datasources
+          configMap:
+            name: {{ include "secure-cloud-pipeline.fullname" . | trunc 40 | trimSuffix "-" }}-grafana-datasources
+        - name: dashboard-provider
+          configMap:
+            name: {{ include "secure-cloud-pipeline.fullname" . | trunc 40 | trimSuffix "-" }}-grafana-dashboards
+            items:
+              - key: provider.yaml
+                path: provider.yaml
+        - name: dashboard-json
+          configMap:
+            name: {{ include "secure-cloud-pipeline.fullname" . | trunc 40 | trimSuffix "-" }}-grafana-dashboards
+            items:
+              - key: pod-resources.json
+                path: pod-resources.json
+        # emptyDir, same reasoning as prometheus.yaml: no StorageClass on
+        # this single-node demo cluster, and the only state Grafana would
+        # otherwise persist here (the provisioned datasource/dashboard,
+        # Grafana's internal sqlite db) is rebuilt from the ConfigMaps
+        # above on every pod restart anyway.
+        - name: storage
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "secure-cloud-pipeline.fullname" . | trunc 40 | trimSuffix "-" }}-grafana
+  labels:
+    {{- include "secure-cloud-pipeline.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 3000
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app.kubernetes.io/name: {{ include "secure-cloud-pipeline.name" . }}-grafana
+    app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}

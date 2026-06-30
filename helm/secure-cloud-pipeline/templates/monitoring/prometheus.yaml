@@ -1,0 +1,147 @@
+{{- if .Values.monitoring.enabled }}
+# Prometheus needs to discover every node and pod in the cluster to scrape
+# them - that's inherently cluster-wide, unlike ecr-secret-cronjob.yaml's
+# Role/RoleBinding, which only ever touches one Secret in one namespace.
+# There's no way to express "watch all pods across all namespaces" with a
+# namespaced Role; ClusterRole is the only object that can grant that.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "secure-cloud-pipeline.fullname" . | trunc 40 | trimSuffix "-" }}-prometheus
+  labels:
+    {{- include "secure-cloud-pipeline.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "secure-cloud-pipeline.fullname" . | trunc 40 | trimSuffix "-" }}-prometheus
+  labels:
+    {{- include "secure-cloud-pipeline.labels" . | nindent 4 }}
+rules:
+  # get/list/watch only - this is a read-only metrics scraper, it never
+  # creates, modifies, or deletes anything in the cluster.
+  - apiGroups: [""]
+    resources: ["nodes", "services", "endpoints", "pods"]
+    verbs: ["get", "list", "watch"]
+  # nodes/proxy is what lets Prometheus reach each kubelet's cAdvisor
+  # endpoint at /api/v1/nodes/<name>/proxy/metrics/cadvisor - without this,
+  # the node-role scrape config below is authenticated but still gets a 403.
+  - apiGroups: [""]
+    resources: ["nodes/proxy"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "secure-cloud-pipeline.fullname" . | trunc 40 | trimSuffix "-" }}-prometheus
+  labels:
+    {{- include "secure-cloud-pipeline.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "secure-cloud-pipeline.fullname" . | trunc 40 | trimSuffix "-" }}-prometheus
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "secure-cloud-pipeline.fullname" . | trunc 40 | trimSuffix "-" }}-prometheus
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "secure-cloud-pipeline.fullname" . | trunc 40 | trimSuffix "-" }}-prometheus-config
+  labels:
+    {{- include "secure-cloud-pipeline.labels" . | nindent 4 }}
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 30s
+
+    scrape_configs:
+      # One job covers both node- and pod-level CPU/memory: each kubelet's
+      # built-in cAdvisor endpoint (k3s ships this out of the box, no
+      # separate node-exporter DaemonSet needed) exposes container_*
+      # metrics for every pod running on that node, plus the node's own
+      # aggregate usage - so discovering nodes and proxying to their
+      # cAdvisor path is enough to get both.
+      - job_name: kubernetes-nodes-cadvisor
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/${1}/proxy/metrics/cadvisor
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "secure-cloud-pipeline.fullname" . | trunc 40 | trimSuffix "-" }}-prometheus
+  labels:
+    {{- include "secure-cloud-pipeline.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "secure-cloud-pipeline.name" . }}-prometheus
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "secure-cloud-pipeline.name" . }}-prometheus
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: {{ include "secure-cloud-pipeline.fullname" . | trunc 40 | trimSuffix "-" }}-prometheus
+      containers:
+        - name: prometheus
+          image: "{{ .Values.monitoring.prometheus.image.repository }}:{{ .Values.monitoring.prometheus.image.tag }}"
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            # No retention beyond what fits in the emptyDir below - this is
+            # a demo dashboard backing store, not a metrics archive.
+            - --storage.tsdb.retention.time=6h
+          ports:
+            - name: http
+              containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+            - name: storage
+              mountPath: /prometheus
+          resources:
+            {{- toYaml .Values.monitoring.prometheus.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "secure-cloud-pipeline.fullname" . | trunc 40 | trimSuffix "-" }}-prometheus-config
+        # emptyDir, not a PersistentVolumeClaim: this is a single-node demo
+        # cluster with no EBS-backed StorageClass wired up, and metrics
+        # history surviving a pod restart isn't the point - the dashboard
+        # repopulates within minutes either way. Data is lost on pod
+        # reschedule/restart; that's an accepted tradeoff, not an oversight.
+        - name: storage
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "secure-cloud-pipeline.fullname" . | trunc 40 | trimSuffix "-" }}-prometheus
+  labels:
+    {{- include "secure-cloud-pipeline.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 9090
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app.kubernetes.io/name: {{ include "secure-cloud-pipeline.name" . }}-prometheus
+    app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}

@@ -5,7 +5,26 @@ show what "least privilege by default" looks like end-to-end — network,
 compute, CI/CD, and secrets — while keeping monthly cost low enough to run
 indefinitely as a personal project.
 
-## Architecture (target state)
+## Project summary
+
+This project provisions a single-node k3s cluster on a private, zero-ingress
+EC2 instance, reachable only through AWS SSM Session Manager — no SSH key,
+no bastion, no public IP anywhere in the account. A Flask app is built into
+a container image by GitHub Actions, which authenticates to AWS via OIDC
+(no long-lived credentials in GitHub) and deploys by sending a shell script
+over SSM rather than exposing the Kubernetes API. Application secrets live
+in AWS Secrets Manager, read by the pod through an IAM role scoped to that
+one secret's ARN. A self-refreshing CronJob keeps the cluster's ECR pull
+credentials valid since this is a self-managed cluster, not EKS, and
+doesn't get EKS's automatic IAM-based registry auth. Finally, Prometheus and
+Grafana give the cluster basic CPU/memory visibility, reachable only via
+`kubectl port-forward` — consistent with the "nothing public-facing" design
+used everywhere else in this project. Every piece is intentionally
+right-sized for a `t3.small` demo box rather than over-built for production
+scale: that scoping-down decision, and the reasoning behind it, is called
+out explicitly in each phase below.
+
+## Architecture
 
 - **Compute**: single-node [k3s](https://k3s.io/) on one EC2 instance running
   a Python Flask app, instead of EKS — avoids the ~$73/mo EKS control plane
@@ -88,7 +107,18 @@ it can't create its own backend without a chicken-and-egg problem.
     fix — a CronJob refreshes `ecr-pull-secret` every 6h from inside the
     cluster, with RBAC scoped to that one Secret (see "Keeping
     `ecr-pull-secret` fresh" below)
-- [ ] Phase 6 — Prometheus + Grafana on the cluster
+- [x] **Phase 6 — Prometheus + Grafana on the cluster** (this commit)
+  - `helm/secure-cloud-pipeline/templates/monitoring/prometheus.yaml`:
+    hand-written Prometheus Deployment + ConfigMap + ClusterIP Service,
+    with cluster-wide RBAC for Kubernetes service discovery
+  - `helm/secure-cloud-pipeline/templates/monitoring/grafana.yaml`:
+    hand-written Grafana Deployment, pre-provisioned with the Prometheus
+    datasource and one pod CPU/memory dashboard, password from a
+    Kubernetes Secret
+  - Both reachable only via `kubectl port-forward` — see "Monitoring:
+    Prometheus + Grafana" below
+
+All six phases are complete.
 
 ## Setting up Phase 1 (do this yourself, by hand)
 
@@ -452,6 +482,112 @@ one instance's own workloads.
    Settings → Secrets and variables → Actions → Variables tab as the
    other four).
 
+## Monitoring: Prometheus + Grafana (Phase 6)
+
+### Why not the kube-prometheus-stack Helm chart
+
+`kube-prometheus-stack` is the standard way to run Prometheus on
+Kubernetes, but it's built for clusters that can absorb its weight:
+Alertmanager, kube-state-metrics, node-exporter as a DaemonSet, multiple
+CRDs, and the Prometheus Operator reconciling all of it — easily 6+ extra
+pods. This is a `t3.small` (2 vCPU, 2GiB RAM) already running k3s's own
+system pods, the app pod, and the `ecr-refresh` CronJob; there isn't
+memory headroom to spare for an operator stack, and most of what it adds
+(alerting, long-term metrics storage, multi-cluster service discovery)
+has no use on a single-node demo cluster anyway. It would also be the only
+third-party Helm chart in a project where every other workload —
+`deployment.yaml`, `ecr-secret-cronjob.yaml` — is a hand-written manifest,
+which makes it harder to read end-to-end and to reason about what RBAC
+each piece actually needs.
+
+So `templates/monitoring/prometheus.yaml` and `templates/monitoring/
+grafana.yaml` are hand-written, in the same style as the rest of this
+chart, scoped down to exactly two pods doing exactly one job: collect
+basic CPU/memory metrics and show them on one dashboard.
+
+**What's deliberately left out**, compared to the full stack:
+
+- **No Alertmanager** — there's no on-call rotation or pager for a
+  portfolio project; alerting rules with nowhere to send them are dead
+  weight.
+- **No node-exporter DaemonSet** — k3s's kubelet already exposes
+  CPU/memory via its built-in cAdvisor endpoint
+  (`/metrics/cadvisor`), which is what `prometheus.yml`'s single
+  scrape job targets. A DaemonSet for this would be redundant on a
+  single-node cluster (it would only ever schedule one pod, same as a
+  plain Deployment) and is one more workload to size and patch.
+- **No kube-state-metrics** — that exposes Kubernetes *object* state
+  (deployment replica counts, pod phase, etc.), not the CPU/memory usage
+  this phase asked for. Skipped because it's out of scope, not because it
+  was hard.
+- **No long-term metrics storage** — `prometheus.yaml` uses `emptyDir`
+  with a 6h retention flag, not a PersistentVolumeClaim. There's no
+  EBS-backed StorageClass wired up for this single-node cluster, and
+  metrics history surviving a pod restart isn't the point of a "proves it
+  works" dashboard — see the comments in `prometheus.yaml` and
+  `grafana.yaml` for the full reasoning.
+- **No public access** — same as everything else in this project: both
+  Services are `ClusterIP`, never `LoadBalancer`, and there's no Ingress.
+  The only way to reach either UI is the `kubectl port-forward` commands
+  below, run from a machine that already has cluster access (see
+  "Reaching the k3s API from your laptop" above for how that access is
+  set up in the first place).
+
+### RBAC: why Prometheus gets a ClusterRole and the ecr-refresh CronJob doesn't
+
+The `ecr-secret-cronjob.yaml` ServiceAccount only ever touches one Secret
+in one namespace, so a namespaced `Role`/`RoleBinding` is the correct,
+narrowest scope for it. Prometheus is structurally different: Kubernetes
+service discovery means *discovering* every node in the cluster and
+proxying to each one's kubelet to scrape `/metrics/cadvisor` — there's no
+way to express "watch nodes and proxy to their kubelet" with a namespaced
+Role, because nodes aren't namespaced objects at all. `prometheus.yaml`'s
+`ClusterRole` grants exactly `get`/`list`/`watch` on `nodes`, `pods`,
+`services`, and `endpoints` (for discovery) plus `get` on the `nodes/proxy`
+subresource (to actually reach kubelet metrics) — read-only, cluster-wide
+because the job is inherently cluster-wide, and nothing more.
+
+### Grafana's admin password
+
+`grafana.yaml` generates an admin password with Helm's `randAlphaNum`
+function rather than hardcoding one in a committed file. A naive
+`randAlphaNum` call would mint a *new* password on every single `helm
+upgrade`, though, locking you out of a cluster you were already logged
+into — so the template first does a `lookup` for an existing Secret from a
+prior install and reuses its password if found, only generating a fresh
+one on a genuinely first install. To pin a specific password instead
+(e.g. for a memorable demo), pass `--set
+monitoring.grafana.adminPassword=<value>` at deploy time, same pattern as
+`image.repository` and `awsRegion` elsewhere in this chart.
+
+### Reaching both UIs locally
+
+Same access model as the k3s API itself (see "Reaching the k3s API from
+your laptop" above) — once you have a working `kubeconfig` for the
+cluster, port-forward each Service directly with `kubectl`. Both Service
+names follow the same `<release-name>-secure-cloud-pipeline-...` pattern
+as the `ecr-refresh` CronJob above (and are subject to the same `trunc 40`
+truncation caveat) — run `kubectl get svc` first to confirm the exact
+names rather than guessing:
+
+```
+kubectl get svc
+
+# Prometheus
+kubectl port-forward svc/<prometheus-service-name> 9090:9090
+
+# Grafana
+kubectl port-forward svc/<grafana-service-name> 3000:3000
+```
+
+Then open `http://localhost:9090` (Prometheus) and `http://localhost:3000`
+(Grafana — log in as `admin`; the password is in the `*-grafana-admin`
+Secret: `kubectl get secret <grafana-admin-secret-name> -o
+jsonpath='{.data.admin-password}' | base64 -d`, find the exact Secret name
+with `kubectl get secret`). The "Pod CPU & Memory" dashboard is
+pre-provisioned and selected by default — no manual data source setup or
+dashboard import needed.
+
 ## Cost notes
 
 - NAT instance (`t3.nano`) instead of NAT Gateway: NAT Gateway bills ~$0.045/hr
@@ -461,6 +597,10 @@ one instance's own workloads.
 - k3s on a single EC2 instance instead of EKS: no $73/mo control plane fee,
   at the cost of no managed HA control plane — acceptable for a portfolio
   project, not for production.
+- Prometheus + Grafana run as two more pods on the existing `t3.small` — no
+  new AWS resource, and therefore no new monthly cost, the way a managed
+  observability service (Amazon Managed Prometheus/Grafana, Datadog, etc.)
+  would have been.
 
 ## A note on `.terraform.lock.hcl`
 

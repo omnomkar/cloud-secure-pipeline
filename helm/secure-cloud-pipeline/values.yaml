@@ -36,3 +36,43 @@ secretsManager:
 # boto3 region (explicit > relying on autodetection) and by the
 # ecr-pull-secret CronJob's `aws ecr get-login-password --region`.
 awsRegion: ""
+
+# Phase 6: Prometheus + Grafana, both reachable only via
+# `kubectl port-forward` - no Service is ever type LoadBalancer, no
+# Ingress is created, consistent with this project's "nothing
+# public-facing" design. Set monitoring.enabled=false to skip deploying
+# either workload entirely.
+monitoring:
+  enabled: true
+
+  prometheus:
+    image:
+      repository: prom/prometheus
+      tag: v2.54.1
+    # Sized the same way as the app's own resources block above - small
+    # on purpose, this is one more pod sharing a t3.small with k3s's
+    # system pods, the app pod, and the ecr-refresh CronJob.
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+
+  grafana:
+    image:
+      repository: grafana/grafana
+      tag: "11.2.0"
+    # Empty by default - leaving this unset doesn't mean "no password",
+    # see the `lookup`/randAlphaNum logic in templates/monitoring/grafana.yaml.
+    # Set via --set monitoring.grafana.adminPassword=<value> to pin it
+    # explicitly instead of letting Helm generate one.
+    adminPassword: ""
+    resources:
+      requests:
+        cpu: 50m
+        memory: 96Mi
+      limits:
+        cpu: 150m
+        memory: 192Mi
