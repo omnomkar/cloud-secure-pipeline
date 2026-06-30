@@ -62,3 +62,11 @@ variable "github_repo" {
   description = "GitHub repository name (without the org prefix) allowed to assume the CI/CD OIDC role"
   type        = string
 }
+
+# No default, and marked sensitive so it never lands in plan/apply output -
+# set this in your own gitignored terraform.tfvars, never commit a real value.
+variable "app_secret_value" {
+  description = "Runtime secret the Flask app reads from AWS Secrets Manager at startup"
+  type        = string
+  sensitive   = true
+}

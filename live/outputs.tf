@@ -42,3 +42,8 @@ output "github_actions_role_arn" {
   description = "ARN of the IAM role GitHub Actions assumes via OIDC - paste this into the repo's AWS_ROLE_ARN Actions variable"
   value       = aws_iam_role.github_actions_deploy.arn
 }
+
+output "app_secret_name" {
+  description = "Name (not value) of the Secrets Manager secret - paste this into the repo's SECRETS_MANAGER_SECRET_NAME Actions variable"
+  value       = aws_secretsmanager_secret.app.name
+}

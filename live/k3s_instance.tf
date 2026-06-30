@@ -81,6 +81,15 @@ resource "aws_instance" "k3s" {
   metadata_options {
     http_endpoint = "enabled"
     http_tokens   = "required" # enforce IMDSv2
+
+    # Default hop limit is 1, which only reaches IMDS requests made
+    # directly from the host's network namespace. boto3 running inside a
+    # pod is one extra network hop away (host -> pod), so a hop limit of 1
+    # makes its IMDS calls silently time out - boto3 then reports "unable
+    # to locate credentials" with nothing pointing at IMDS as the cause.
+    # 2 hops covers host -> pod without raising the limit any further than
+    # this instance's own workloads need.
+    http_put_response_hop_limit = 2
   }
 
   root_block_device {
