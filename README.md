@@ -7,24 +7,111 @@ indefinitely as a personal project.
 
 ## Project summary
 
-This project provisions a single-node k3s cluster on a private, zero-ingress
-EC2 instance, reachable only through AWS SSM Session Manager — no SSH key,
-no bastion, no public IP anywhere in the account. A Flask app is built into
-a container image by GitHub Actions, which authenticates to AWS via OIDC
-(no long-lived credentials in GitHub) and deploys by sending a shell script
-over SSM rather than exposing the Kubernetes API. Application secrets live
-in AWS Secrets Manager, read by the pod through an IAM role scoped to that
-one secret's ARN. A self-refreshing CronJob keeps the cluster's ECR pull
-credentials valid since this is a self-managed cluster, not EKS, and
-doesn't get EKS's automatic IAM-based registry auth. Finally, Prometheus and
-Grafana give the cluster basic CPU/memory visibility, reachable only via
-`kubectl port-forward` — consistent with the "nothing public-facing" design
-used everywhere else in this project. Every piece is intentionally
-right-sized for a `t3.small` demo box rather than over-built for production
-scale: that scoping-down decision, and the reasoning behind it, is called
-out explicitly in each phase below.
+This project demonstrates security-first cloud infrastructure: least-privilege
+IAM throughout, zero public IPs or open inbound ports anywhere in the account,
+and short-lived credentials end-to-end — OIDC for CI/CD, IMDS for the app,
+SSM for shell access, no static AWS keys, no SSH keys. It's equally
+cost-conscious by design: a NAT instance instead of a NAT Gateway, k3s
+instead of EKS, hand-written manifests instead of a third-party Helm chart
+for monitoring — each tradeoff explained where it's made, not just listed.
+And it's a record of real debugging, not just a finished diagram: six
+concrete, production-grade issues — an OIDC trust-policy bug, a cgroup v1/v2
+incompatibility, a Helm naming-limit collision, among others — were hit and
+fixed while building this, detailed in **Lessons learned** below.
 
-## Architecture
+The live AWS infrastructure has since been torn down to avoid ongoing cost,
+so there's no demo link here. The diagram, the Lessons learned section, and
+the infrastructure code itself are the evidence that it worked — see
+"Redeploying this project" further down if you want to stand it back up.
+
+## Architecture diagram
+
+```mermaid
+flowchart LR
+    GHA["GitHub Actions<br/>(OIDC auth)"]
+    ECR[("Amazon ECR")]
+    SM[("AWS Secrets<br/>Manager")]
+
+    subgraph VPC["AWS VPC — zero public IPs on any workload"]
+        direction LR
+        NAT["NAT Instance<br/>(public subnet)"]
+        subgraph K3S["k3s EC2 Node (private subnet)"]
+            direction TB
+            APP["App Pod"]
+            PROM["Prometheus"]
+            GRAF["Grafana"]
+            CRON["ecr-refresh CronJob"]
+        end
+    end
+
+    GHA -- "push image (OIDC)" --> ECR
+    GHA -- "ssm send-command (deploy)" --> K3S
+    K3S -- "outbound only, via NAT" --> NAT
+    CRON -- "refresh ECR pull token" --> ECR
+    APP -- "GetSecretValue (scoped IAM role)" --> SM
+```
+
+No inbound security group rule exists anywhere in this diagram — the only
+path into the private subnet is GitHub Actions' `ssm:SendCommand` call,
+itself scoped to one instance and one SSM document (see "Why OIDC instead
+of access keys" below).
+
+## Lessons learned
+
+Six real issues surfaced while building this, each fixed in the code rather
+than worked around:
+
+- **k3s install failing on a SELinux RPM lookup.** The install script tries
+  to install a `k3s-selinux` RPM matched to the host OS; Amazon Linux 2023
+  didn't have one published at the pinned k3s version, so the step had
+  nothing valid to install. Fixed by passing
+  `INSTALL_K3S_SKIP_SELINUX_RPM=true` to the installer in
+  `live/templates/k3s-user-data.sh.tpl` — SELinux enforcement isn't part of
+  this project's threat model anyway, so skipping it costs nothing.
+- **cgroup v1/v2 mismatch with Kubernetes 1.36.** k3s v1.36+ fully dropped
+  cgroup v1 support, but Amazon Linux 2 — the AMI used everywhere else in
+  this project, including the NAT instance — defaults to cgroup v1, so k3s
+  wouldn't start cleanly on it. Diagnosed by checking k3s's own release
+  notes against the AMI's default cgroup driver, then fixed by giving the
+  k3s node its own AMI lookup pinned to Amazon Linux 2023 (cgroup v2 by
+  default) in `live/k3s_instance.tf`, separate from the NAT instance's AMI.
+- **AL2023's "minimal" AMI variant has no SSM agent.** AWS publishes more
+  than one AL2023 AMI family; the minimal variant strips out preinstalled
+  agents — including the SSM agent — to shrink image size. On a node with
+  zero inbound security group rules and no SSH, a missing SSM agent means
+  no path in at all: the instance boots but never appears as a "Managed
+  Instance." Fixed by pinning the AMI filter to the standard (non-minimal)
+  AL2023 family, which ships the agent preinstalled.
+- **GitHub OIDC role rejected despite a correct trust policy.** The IAM
+  role's trust policy had the right OIDC provider, the right `sub`/`aud`
+  conditions, scoped to the right repo and branch — and AWS still denied
+  every assume-role attempt. The `Action` was `sts:AssumeRole`, the call
+  used for ordinary cross-account role chaining, instead of
+  `sts:AssumeRoleWithWebIdentity`, the specific STS API a `Federated` OIDC
+  principal must call; IAM matches trust policies against the exact action
+  requested, so the near-identical-sounding action was an outright denial,
+  not a permissions gap. Fixed in `live/oidc.tf`.
+- **EKS-only ECR auth doesn't exist on a self-managed cluster.** Pods sat in
+  `ImagePullBackOff` despite the node's IAM role having correct ECR pull
+  permissions, on the assumption that containerd would pick up that role
+  automatically the way EKS's ECR credential helper does. That integration
+  is EKS-specific — stock containerd/k3s has no equivalent. Fixed by adding
+  an explicit `ecr-pull-secret` `imagePullSecrets` entry to
+  `deployment.yaml`, refreshed automatically since ECR tokens expire after
+  ~12h (see "Keeping `ecr-pull-secret` fresh" below).
+- **Helm CronJob name overflow collided with the app's own Service.** The
+  chart's standard `<release>-<chart>-...` naming pattern, applied to the
+  `ecr-refresh` CronJob, pushed the generated name past Kubernetes' object
+  name limits; separately, the CronJob's pod template reused the chart's
+  shared `selectorLabels` helper, which is the exact label set the app's
+  `Service` selects on — so a running CronJob pod started absorbing traffic
+  meant for the app, despite not listening on port 5000. Fixed by
+  truncating the CronJob/ServiceAccount names with `trunc 40 | trimSuffix
+  "-"` before appending suffixes, and giving the CronJob's pods their own
+  distinct labels instead of reusing the app's selector labels — both in
+  `helm/secure-cloud-pipeline/templates/ecr-secret-cronjob.yaml`.
+
+## Architecture details
 
 - **Compute**: single-node [k3s](https://k3s.io/) on one EC2 instance running
   a Python Flask app, instead of EKS — avoids the ~$73/mo EKS control plane
@@ -120,7 +207,11 @@ it can't create its own backend without a chicken-and-egg problem.
 
 All six phases are complete.
 
-## Setting up Phase 1 (do this yourself, by hand)
+## Redeploying this project
+
+The infrastructure described below was torn down after this project was
+finished, to avoid ongoing AWS cost — these are the steps to stand it back
+up from scratch, not instructions for reaching anything currently running.
 
 1. **Create the state backend** (uses local state, since it's creating the
    backend itself):
