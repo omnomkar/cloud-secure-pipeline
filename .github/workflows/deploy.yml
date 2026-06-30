@@ -21,6 +21,7 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION }}
   ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
   K3S_INSTANCE_ID: ${{ vars.K3S_INSTANCE_ID }}
+  SECRETS_MANAGER_SECRET_NAME: ${{ vars.SECRETS_MANAGER_SECRET_NAME }}
 
 jobs:
   build-and-deploy:
@@ -93,7 +94,9 @@ jobs:
           export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
           helm upgrade --install secure-cloud-pipeline /tmp/scp-deploy/helm/secure-cloud-pipeline \
             --set image.repository="${ECR_REGISTRY}/${ECR_REPOSITORY}" \
-            --set image.tag="${IMAGE_TAG}"
+            --set image.tag="${IMAGE_TAG}" \
+            --set secretsManager.secretName="${SECRETS_MANAGER_SECRET_NAME}" \
+            --set awsRegion="${AWS_REGION}"
           EOF
 
           jq -n --rawfile script deploy.sh '{commands: [$script]}' > params.json

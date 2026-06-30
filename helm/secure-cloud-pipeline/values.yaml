@@ -21,6 +21,18 @@ resources:
     cpu: 250m
     memory: 256Mi
 
-# Placeholder until Phase 5 wires this up to AWS Secrets Manager instead.
+# Local-dev fallback only - used when secretsManager.secretName is empty.
 app:
   secretMessage: "default-message-not-from-secrets-manager-yet"
+
+# Empty by default. Set via --set secretsManager.secretName=<name> at
+# deploy time, same pattern as image.repository - when set, the app reads
+# its secret from this Secrets Manager secret instead of app.secretMessage.
+secretsManager:
+  secretName: ""
+
+# No default, same reasoning as image.repository - set via
+# --set awsRegion=<region> at deploy time. Used both as the app's
+# boto3 region (explicit > relying on autodetection) and by the
+# ecr-pull-secret CronJob's `aws ecr get-login-password --region`.
+awsRegion: ""

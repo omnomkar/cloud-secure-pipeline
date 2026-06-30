@@ -30,6 +30,10 @@ spec:
           env:
             - name: APP_SECRET_MESSAGE
               value: {{ .Values.app.secretMessage | quote }}
+            - name: SECRETS_MANAGER_SECRET_NAME
+              value: {{ .Values.secretsManager.secretName | quote }}
+            - name: AWS_REGION
+              value: {{ .Values.awsRegion | quote }}
           livenessProbe:
             httpGet:
               path: /health

@@ -72,7 +72,22 @@ it can't create its own backend without a chicken-and-egg problem.
   - `helm/secure-cloud-pipeline/`: Helm chart for the Flask app
   - `.github/workflows/deploy.yml`: builds/pushes the image via OIDC, then
     deploys it by sending a script through SSM - no exposed k3s API
-- [ ] Phase 5 — Secrets Manager integration, least-privilege IAM for app
+- [x] **Phase 5 — Secrets Manager integration, least-privilege IAM for app**
+      (this commit)
+  - `live/secrets.tf`: Secrets Manager secret for the app's runtime
+    message, plus a `secretsmanager:GetSecretValue` grant on the k3s
+    node's existing IAM role, scoped to that one secret's ARN
+  - `live/k3s_instance.tf`: `http_put_response_hop_limit = 2` so IMDS is
+    reachable from inside a pod, not just from the host (see the
+    dedicated gotcha section below)
+  - `app/app.py`: reads the secret from Secrets Manager via boto3 at
+    startup when `SECRETS_MANAGER_SECRET_NAME` is set, falls back to the
+    Phase 2 behavior when it isn't
+  - `helm/secure-cloud-pipeline/templates/ecr-secret-cronjob.yaml` +
+    `serviceaccount.yaml`: closes the gap from Phase 4's `imagePullSecrets`
+    fix — a CronJob refreshes `ecr-pull-secret` every 6h from inside the
+    cluster, with RBAC scoped to that one Secret (see "Keeping
+    `ecr-pull-secret` fresh" below)
 - [ ] Phase 6 — Prometheus + Grafana on the cluster
 
 ## Setting up Phase 1 (do this yourself, by hand)
@@ -239,10 +254,79 @@ conventional resource naming. `APP_SECRET_MESSAGE` is wired in via
 Secrets Manager read without changing the chart's shape. Resource
 requests/limits are sized small on purpose (100m/128Mi requests,
 250m/256Mi limits) so a single pod doesn't crowd out k3s's own system pods
-on a `t3.small`. There's no `imagePullSecrets` anywhere in the chart — the
-k3s node's IAM role from Phase 3 already has ECR pull permissions, and
-containerd picks those up automatically, so there's no pull credential to
-create, store, or rotate.
+on a `t3.small`.
+
+> **Correction:** an earlier version of this section claimed no
+> `imagePullSecrets` was needed because containerd would pick up the node's
+> IAM role automatically, the way EKS does. That's wrong — automatic
+> IAM-role-based ECR auth is an EKS-specific integration, not something
+> stock containerd/k3s does on its own. `deployment.yaml` now references
+> an `ecr-pull-secret` image pull secret instead, kept fresh by a CronJob —
+> see "Keeping `ecr-pull-secret` fresh" below.
+
+### Keeping `ecr-pull-secret` fresh
+
+A Kubernetes image pull secret holding an ECR token doesn't stay valid —
+ECR tokens expire after ~12h, so creating it once (by hand, or via a
+one-time Terraform provisioner) just defers the `ImagePullBackOff` instead
+of preventing it. A provisioner has the same problem twice over: it would
+also depend on the SSM port-forward tunnel and `KUBECONFIG` being active
+at the exact moment `terraform apply` runs, which is its own source of
+flakiness.
+
+Instead, `helm/secure-cloud-pipeline/templates/ecr-secret-cronjob.yaml`
+runs **inside the cluster** every 6 hours (comfortably inside the ~12h
+token life) and re-creates the secret from scratch:
+
+1. Fetches a fresh ECR token with `aws ecr get-login-password`.
+2. Turns it into a `kubernetes.io/dockerconfigjson` secret via
+   `kubectl create secret docker-registry ... --dry-run=client -o yaml |
+   kubectl apply -f -` — the dry-run-then-apply pattern makes this
+   idempotent. It overwrites `ecr-pull-secret` in place on every run
+   instead of erroring because it already exists, which also means **no
+   manual cleanup is needed** if a secret of that name already exists from
+   being created by hand before this CronJob existed — the next run just
+   takes over managing it.
+
+Two things make this work without any new IAM or credentials:
+
+- **AWS credentials**: this is a single-node cluster, so the CronJob's pod
+  runs on the same EC2 instance whose IAM role already has
+  `ecr:GetAuthorizationToken` (granted in Phase 3, `Resource "*"` — the
+  only action `get-login-password` calls). The AWS CLI's default
+  credential chain reaches that role over IMDS exactly the way the app's
+  boto3 calls do, both depending on the `http_put_response_hop_limit = 2`
+  fix from Phase 5 to cross the one extra host-to-pod network hop. No new
+  IAM permission, and no Kubernetes Secret holding AWS credentials, is
+  needed for this CronJob at all.
+- **Cluster credentials**: `kubectl` auto-detects in-cluster config from
+  the pod's mounted ServiceAccount token, so no kubeconfig file is needed
+  inside the container — unlike the SSM deploy script, which runs
+  directly on the host and does need `/etc/rancher/k3s/k3s.yaml`. RBAC for
+  that ServiceAccount (`templates/serviceaccount.yaml`) is scoped to
+  exactly one Secret by name: it can `create` Secrets in this namespace
+  (RBAC `resourceNames` can't restrict `create` — there's no existing
+  object yet to check the name against) but `get`/`update`/`patch` are
+  pinned to `ecr-pull-secret` specifically, so it can't touch any other
+  Secret in the namespace.
+
+`kubectl` itself isn't part of the `aws-cli` base image, so the CronJob
+fetches it via `curl` at runtime — the same on-demand-binary pattern the
+SSM deploy script already uses to bootstrap Helm, rather than maintaining
+and publishing a custom image just to bundle two CLIs together.
+
+One practical gap: a CronJob doesn't run immediately when it's first
+created, only at its next scheduled tick — so on a brand-new cluster with
+no pre-existing `ecr-pull-secret`, the very first deploy's pod can sit in
+`ImagePullBackOff` for up to 6h until the CronJob's first run. Trigger it
+once by hand to skip that wait (the CronJob is named
+`<release-name>-secure-cloud-pipeline-ecr-refresh` — `secure-cloud-pipeline-secure-cloud-pipeline-ecr-refresh`
+for the release name used in `deploy.yml`; run `kubectl get cronjob` to
+confirm):
+```
+kubectl create job --from=cronjob/secure-cloud-pipeline-secure-cloud-pipeline-ecr-refresh \
+  ecr-refresh-bootstrap
+```
 
 ### How a deploy actually happens
 
@@ -294,9 +378,79 @@ tell a workflow which role to use — that's a one-time manual step after
      `secure-cloud-pipeline-app`), not the full URL; derive it from the
      `ecr_repository_url` output.
    - `K3S_INSTANCE_ID` — the `k3s_instance_id` output.
+   - `SECRETS_MANAGER_SECRET_NAME` — the `app_secret_name` output (added in
+     Phase 5; see below).
 
-Once those four variables are set, a push to `main` touching `app/**` or
+Once those variables are set, a push to `main` touching `app/**` or
 `Dockerfile` triggers the full build-push-deploy pipeline automatically.
+
+## Secrets Manager and the IMDS hop-limit gotcha (Phase 5)
+
+### Wiring the app up to Secrets Manager
+
+`live/secrets.tf` creates one `aws_secretsmanager_secret` (named
+`<project_name>-app-secret`) and a version holding `var.app_secret_value`
+— a required, `sensitive = true` variable with no default, set only in
+your own gitignored `terraform.tfvars`. It also grants the k3s node's
+*existing* IAM role (from Phase 3) exactly one new permission:
+`secretsmanager:GetSecretValue`, scoped to that one secret's ARN. That
+grant is its own `aws_iam_role_policy` resource rather than being folded
+into `k3s_instance_ecr` in `k3s_instance.tf` — same role, two policies
+attached to it, so the ECR pull policy and the secrets-read policy stay
+independently readable and don't need to be touched together.
+
+`app/app.py` reads `SECRETS_MANAGER_SECRET_NAME` once at import time (not
+per-request — the value doesn't change without a redeploy, and Secrets
+Manager bills per call):
+
+- If that env var **is set**, it fetches the secret via boto3 and uses it
+  as `APP_SECRET_MESSAGE`. If the fetch fails for any reason (missing
+  permission, wrong secret name, no network path), the app **crashes on
+  startup** rather than silently falling back — when this env var is set,
+  a working Secrets Manager read isn't optional, and masking a permissions
+  problem behind a placeholder string would only delay finding it.
+- If it **isn't set**, the app falls back to the Phase 2 behavior
+  (`APP_SECRET_MESSAGE` env var, then a literal default) — zero AWS access
+  required, so it still runs standalone for local testing.
+
+The Helm chart passes this through as a plain env var
+(`secretsManager.secretName` in `values.yaml`, set via `--set` at deploy
+time exactly like `image.repository`) — `deployment.yaml` always sets
+`SECRETS_MANAGER_SECRET_NAME`, defaulting to an empty string, which the
+app treats the same as "not set."
+
+### Gotcha: pods need a higher IMDS hop limit than the host does
+
+This one is easy to lose hours to, so it's called out on its own. EC2's
+instance metadata service (IMDS) — which boto3 uses to find credentials
+when there's no access key lying around — has a **hop limit**, separate
+from `http_tokens` (the IMDSv2 toggle). The default hop limit is **1**,
+which only allows IMDS requests that originate directly in the host's own
+network namespace.
+
+Once boto3 runs *inside a pod*, it's making that same request from a
+*different* network namespace — one hop further from the IMDS endpoint
+than the host itself. With a hop limit of 1, that extra hop gets the
+packet silently dropped. boto3 doesn't surface "IMDS hop limit too low" as
+the error — it just reports something like "Unable to locate credentials,"
+which looks identical to a missing/misconfigured IAM role and sends you
+debugging the wrong thing.
+
+The fix is one line in `live/k3s_instance.tf`'s `metadata_options` block:
+`http_put_response_hop_limit = 2`. That's the minimum needed to cover
+host → pod, and no more — it doesn't open IMDS up to anything beyond this
+one instance's own workloads.
+
+### Manual setup added in this phase
+
+1. Set `app_secret_value` in your real `terraform.tfvars` (copy it from
+   `terraform.tfvars.example` if you haven't already) before running
+   `terraform apply` — there's no default, so `apply` will prompt for it
+   if it's missing.
+2. After `apply`, run `terraform output app_secret_name` and add it as a
+   5th GitHub repository variable, `SECRETS_MANAGER_SECRET_NAME` (same
+   Settings → Secrets and variables → Actions → Variables tab as the
+   other four).
 
 ## Cost notes
 
