@@ -1,6 +1,6 @@
 # image.repository has no default - it's set per-deploy via
 # `--set image.repository=<ecr-registry>/<ecr-repo>` so this chart never
-# hardcodes an AWS account ID.
+# hardcodes an AWS account ID
 image:
   repository: ""
   tag: "latest"

@@ -6,6 +6,7 @@ on:
     paths:
       - "app/**"
       - "Dockerfile"
+      - "helm/**"
 
 # id-token: write is what lets this workflow request an OIDC token from
 # GitHub at all - without it, configure-aws-credentials has nothing to hand
