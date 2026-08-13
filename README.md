@@ -1,5 +1,10 @@
 # secure-cloud-pipeline
 
+A security-conscious cloud infrastructure portfolio project. The goal is to
+show what "least privilege by default" looks like end-to-end — network,
+compute, CI/CD, and secrets — while keeping monthly cost low enough to run
+indefinitely as a personal project.
+
 ![Zero inbound rules, no public IP, and a working deploy anyway](demo/cloud-secure-pipeline.gif)
 
 *The k3s node's security group has no ingress rules and the instance has no public IP — yet a shell lands on it via SSM Session Manager, three workloads are running, and the app returns a secret read from AWS Secrets Manager over IMDS.*
@@ -27,10 +32,6 @@
   </tr>
 </table>
 
-A security-conscious cloud infrastructure portfolio project. The goal is to
-show what "least privilege by default" looks like end-to-end — network,
-compute, CI/CD, and secrets — while keeping monthly cost low enough to run
-indefinitely as a personal project.
 
 ## Project summary
 
