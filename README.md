@@ -1,5 +1,9 @@
 # secure-cloud-pipeline
 
+![Zero inbound rules, no public IP, and a working deploy anyway](demo/cloud-secure-pipeline.gif)
+
+*The k3s node's security group has no ingress rules and the instance has no public IP — yet a shell lands on it via SSM Session Manager, three workloads are running, and the app returns a secret read from AWS Secrets Manager over IMDS.*
+
 A security-conscious cloud infrastructure portfolio project. The goal is to
 show what "least privilege by default" looks like end-to-end — network,
 compute, CI/CD, and secrets — while keeping monthly cost low enough to run
@@ -22,10 +26,12 @@ OIDC trust-policy bug, a cgroup v1/v2 incompatibility, a Helm naming-limit
 collision, among others — were hit and fixed while building this, detailed
 in **Lessons learned** below.
 
-The live AWS infrastructure has since been torn down to avoid ongoing cost,
-so there's no demo link here. The diagram, the Lessons learned section, and
-the infrastructure code itself are the evidence that it worked — see
-"Redeploying this project" further down if you want to stand it back up.
+The recordings and screenshots throughout this README were captured against
+live infrastructure in August 2026; it was torn down afterward to avoid
+ongoing cost, so there's no live demo link. The diagram, the Lessons learned
+section, and the infrastructure code itself cover the parts a recording
+can't show — see "Redeploying this project" further down if you want to
+stand it back up.
 
 ## Architecture diagram
 
@@ -360,6 +366,10 @@ kubectl --kubeconfig ./k3s.yaml get nodes
 
 ## CI/CD: GitHub Actions OIDC, Helm, and SSM deploy (Phase 4)
 
+![GitHub Actions run: OIDC auth, ECR push, and SSM deploy returning Success](demo/actions-ssm-deploy.png)
+
+*A full pipeline run: no AWS access keys, an image pushed to ECR, and `helm upgrade` executed on the node through `ssm:SendCommand` — with the workflow polling `get-command-invocation` until it reports Success.*
+
 ### Why OIDC instead of access keys
 
 `live/oidc.tf` creates an `aws_iam_openid_connect_provider` trusting
@@ -601,6 +611,12 @@ one instance's own workloads.
 
 ## Monitoring: Prometheus + Grafana (Phase 6)
 
+![Grafana Pod CPU & Memory dashboard with live metrics](demo/grafana-pod-resources.png)
+
+![Prometheus targets page showing the kubelet cAdvisor scrape job UP](demo/prometheus-targets.png)
+
+*Prometheus discovers the node through the Kubernetes API and scrapes kubelet's cAdvisor endpoint via the `nodes/proxy` subresource — the read-only ClusterRole described below is what makes that scrape possible.*
+
 ### Why not the kube-prometheus-stack Helm chart
 
 `kube-prometheus-stack` is the standard way to run Prometheus on
@@ -720,7 +736,7 @@ honest test of whether the automation was tied to the platform or only to
 the tools — and it turned out to be the latter, since every gate is just a
 container invocation.
 
-![Jenkins pipeline, all stages green](docs/jenkins-pipeline.png)
+![Jenkins pipeline, all stages green](demo/jenkins-pipeline.png)
 
 ### What it runs
 
