@@ -4,6 +4,29 @@
 
 *The k3s node's security group has no ingress rules and the instance has no public IP — yet a shell lands on it via SSM Session Manager, three workloads are running, and the app returns a secret read from AWS Secrets Manager over IMDS.*
 
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <a href="demo/actions-ssm-deploy.png"><img src="demo/actions-ssm-deploy.png" alt="GitHub Actions run: OIDC auth, ECR push, and SSM deploy returning Success"></a>
+      <br><sub><b>GitHub Actions → ECR → SSM deploy.</b> No AWS access keys anywhere; <code>helm upgrade</code> runs on the node through <code>ssm:SendCommand</code>, polled until it reports Success.</sub>
+    </td>
+    <td width="50%" align="center">
+      <a href="demo/jenkins-pipeline.png"><img src="demo/jenkins-pipeline.png" alt="Jenkins pipeline, all stages green"></a>
+      <br><sub><b>The same gates, rebuilt on Jenkins.</b> <code>ruff</code> and both Checkov scans fanned out in parallel, then build and chart render — every gate a throwaway container.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <a href="demo/grafana-pod-resources.png"><img src="demo/grafana-pod-resources.png" alt="Grafana Pod CPU &amp; Memory dashboard with live metrics"></a>
+      <br><sub><b>Grafana, pre-provisioned by the chart.</b> The Pod CPU &amp; Memory dashboard and its datasource ship with the release — no manual import, no public endpoint.</sub>
+    </td>
+    <td width="50%" align="center">
+      <a href="demo/prometheus-targets.png"><img src="demo/prometheus-targets.png" alt="Prometheus targets page showing the kubelet cAdvisor scrape job UP"></a>
+      <br><sub><b>Prometheus scraping kubelet.</b> The node is discovered through the Kubernetes API and cAdvisor reached via the <code>nodes/proxy</code> subresource, on a read-only ClusterRole.</sub>
+    </td>
+  </tr>
+</table>
+
 A security-conscious cloud infrastructure portfolio project. The goal is to
 show what "least privilege by default" looks like end-to-end — network,
 compute, CI/CD, and secrets — while keeping monthly cost low enough to run
@@ -366,10 +389,6 @@ kubectl --kubeconfig ./k3s.yaml get nodes
 
 ## CI/CD: GitHub Actions OIDC, Helm, and SSM deploy (Phase 4)
 
-![GitHub Actions run: OIDC auth, ECR push, and SSM deploy returning Success](demo/actions-ssm-deploy.png)
-
-*A full pipeline run: no AWS access keys, an image pushed to ECR, and `helm upgrade` executed on the node through `ssm:SendCommand` — with the workflow polling `get-command-invocation` until it reports Success.*
-
 ### Why OIDC instead of access keys
 
 `live/oidc.tf` creates an `aws_iam_openid_connect_provider` trusting
@@ -611,12 +630,6 @@ one instance's own workloads.
 
 ## Monitoring: Prometheus + Grafana (Phase 6)
 
-![Grafana Pod CPU & Memory dashboard with live metrics](demo/grafana-pod-resources.png)
-
-![Prometheus targets page showing the kubelet cAdvisor scrape job UP](demo/prometheus-targets.png)
-
-*Prometheus discovers the node through the Kubernetes API and scrapes kubelet's cAdvisor endpoint via the `nodes/proxy` subresource — the read-only ClusterRole described below is what makes that scrape possible.*
-
 ### Why not the kube-prometheus-stack Helm chart
 
 `kube-prometheus-stack` is the standard way to run Prometheus on
@@ -735,8 +748,6 @@ physical hardware. Rebuilding the gates on a self-hosted Jenkins is the
 honest test of whether the automation was tied to the platform or only to
 the tools — and it turned out to be the latter, since every gate is just a
 container invocation.
-
-![Jenkins pipeline, all stages green](demo/jenkins-pipeline.png)
 
 ### What it runs
 
